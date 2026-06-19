@@ -13,9 +13,23 @@ const ORDERS_COLLECTION = 'orders';
 
 const LTC_ORDER_TTL_MS = 30 * 60 * 1000;
 
+const DURATION_LABELS = {
+  '1j': '1 Jour',
+  '1s': '1 Semaine',
+  '1m': '1 Mois',
+  '3m': '3 Mois',
+  'lifetime': 'Lifetime',
+};
+
+function getPriceForDuration(product, duration) {
+  const prices = product.prices || {};
+  if (!duration || prices[duration] === undefined) return null;
+  return Number(prices[duration]);
+}
+
 router.post('/create-order', createOrderLimiter, async (req, res) => {
   try {
-    const { productId, email } = req.body;
+    const { productId, email, duration } = req.body;
     if (!productId) return res.status(400).json({ error: 'productId requis.' });
     if (!email) return res.status(400).json({ error: 'email requis pour recevoir la clé.' });
 
@@ -25,6 +39,11 @@ router.post('/create-order', createOrderLimiter, async (req, res) => {
     const product = productDoc.data();
     if (product.status !== 'active') {
       return res.status(400).json({ error: 'Ce produit n\'est plus disponible.' });
+    }
+
+    const price = getPriceForDuration(product, duration);
+    if (price === null) {
+      return res.status(400).json({ error: 'Offre (durée) invalide pour ce produit.' });
     }
 
     const accessToken = await getAccessToken();
@@ -40,10 +59,10 @@ router.post('/create-order', createOrderLimiter, async (req, res) => {
         purchase_units: [
           {
             reference_id: productId,
-            description: product.name,
+            description: `${product.name} — ${DURATION_LABELS[duration] || duration}`,
             amount: {
               currency_code: 'EUR',
-              value: Number(product.price).toFixed(2),
+              value: price.toFixed(2),
             },
           },
         ],
@@ -60,7 +79,8 @@ router.post('/create-order', createOrderLimiter, async (req, res) => {
       paypalOrderId: orderData.id,
       productId,
       productName: product.name,
-      amount: Number(product.price),
+      duration,
+      amount: price,
       currency: 'EUR',
       customerEmail: email,
       status: 'pending',
@@ -206,7 +226,7 @@ router.get('/orders', requireAuth, async (req, res) => {
 
 router.post('/create-order-ltc', createOrderLimiter, async (req, res) => {
   try {
-    const { productId, email } = req.body;
+    const { productId, email, duration } = req.body;
     if (!productId) return res.status(400).json({ error: 'productId requis.' });
     if (!email) return res.status(400).json({ error: 'email requis pour recevoir la clé.' });
     if (!LTC_ADDRESS) return res.status(503).json({ error: 'Paiement Litecoin non configuré (LTC_ADDRESS manquant).' });
@@ -219,8 +239,13 @@ router.post('/create-order-ltc', createOrderLimiter, async (req, res) => {
       return res.status(400).json({ error: 'Ce produit n\'est plus disponible.' });
     }
 
+    const priceEur = getPriceForDuration(product, duration);
+    if (priceEur === null) {
+      return res.status(400).json({ error: 'Offre (durée) invalide pour ce produit.' });
+    }
+
     const rate = await getLtcEurRate();
-    const amountLtc = eurToLtc(Number(product.price), rate);
+    const amountLtc = eurToLtc(priceEur, rate);
     const createdAt = new Date().toISOString();
     const expiresAt = new Date(Date.now() + LTC_ORDER_TTL_MS).toISOString();
 
@@ -228,7 +253,8 @@ router.post('/create-order-ltc', createOrderLimiter, async (req, res) => {
       method: 'ltc',
       productId,
       productName: product.name,
-      amountEur: Number(product.price),
+      duration,
+      amountEur: priceEur,
       amountLtc,
       ltcEurRate: rate,
       address: LTC_ADDRESS,
@@ -242,7 +268,7 @@ router.post('/create-order-ltc', createOrderLimiter, async (req, res) => {
       id: orderRef.id,
       address: LTC_ADDRESS,
       amountLtc,
-      amountEur: Number(product.price),
+      amountEur: priceEur,
       rate,
       expiresAt,
     });

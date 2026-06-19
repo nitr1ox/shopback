@@ -21,9 +21,23 @@ function loadCredentials() {
 if (!admin.apps.length) {
   admin.initializeApp({
     credential: admin.credential.cert(loadCredentials()),
+    storageBucket: process.env.FIREBASE_STORAGE_BUCKET || undefined,
   });
 }
 
 const db = admin.firestore();
 
-module.exports = { admin, db };
+let bucket = null;
+function getBucket() {
+  if (!process.env.FIREBASE_STORAGE_BUCKET) {
+    throw new Error(
+      'FIREBASE_STORAGE_BUCKET manquant dans .env — nécessaire pour uploader des images.'
+    );
+  }
+  if (!bucket) {
+    bucket = admin.storage().bucket();
+  }
+  return bucket;
+}
+
+module.exports = { admin, db, getBucket };
