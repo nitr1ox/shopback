@@ -67,7 +67,7 @@ router.post('/create-order', createOrderLimiter, async (req, res) => {
       createdAt: new Date().toISOString(),
     });
 
-    res.status(201).json({ id: orderData.id });
+    res.status(201).json({ id: orderData.id, paypalClientId: process.env.PAYPAL_CLIENT_ID });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Erreur serveur lors de la création de la commande.' });
