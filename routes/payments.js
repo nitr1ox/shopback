@@ -2,16 +2,14 @@ const express = require('express');
 const router = express.Router();
 const { db } = require('../config/firebase');
 const { getAccessToken, BASE_URL } = require('../config/paypal');
-const { LTC_ADDRESS, getLtcEurRate, eurToLtc, getReceivedSince } = require('../config/litecoin');
+const nowpayments = require('../config/nowpayments');
 const { sendOrderKeyEmail } = require('../config/mailer');
-const { generateKey } = require('../utils/generateKey');
+const { consumeKey } = require('../utils/stock');
 const { requireAuth } = require('../middleware/auth');
 const { createOrderLimiter, captureOrderLimiter, checkLtcLimiter } = require('../middleware/rateLimiter');
 
 const PRODUCTS_COLLECTION = 'products';
 const ORDERS_COLLECTION = 'orders';
-
-const LTC_ORDER_TTL_MS = 30 * 60 * 1000;
 
 const DURATION_LABELS = {
   '1j': '1 Jour',
@@ -181,7 +179,20 @@ router.post('/capture-order/:orderId', captureOrderLimiter, async (req, res) => 
         });
       }
 
-      accessKey = generateKey();
+      try {
+        accessKey = await consumeKey(orderInfo.productId, orderInfo.duration);
+      } catch (stockErr) {
+        console.error(`⚠️ Stock épuisé pour la commande ${orderId} (paiement déjà capturé) :`, stockErr.message);
+        updateData.status = 'paid_no_stock';
+        updateData.stockError = stockErr.message;
+        await orderRef.update(updateData);
+        return res.status(202).json({
+          success: true,
+          status: 'PAID_NO_STOCK',
+          orderId,
+          error: 'Paiement confirmé mais stock de clés épuisé. Le support va te contacter pour te fournir ta clé.',
+        });
+      }
       updateData.accessKey = accessKey;
 
       const recipient = orderInfo.customerEmail || captureData.payer?.email_address;
@@ -224,12 +235,22 @@ router.get('/orders', requireAuth, async (req, res) => {
   }
 });
 
-router.post('/create-order-ltc', createOrderLimiter, async (req, res) => {
+router.get('/crypto-currencies', async (req, res) => {
   try {
-    const { productId, email, duration } = req.body;
+    const data = await nowpayments.getAvailableCurrencies();
+    res.json(data);
+  } catch (err) {
+    console.error(err);
+    res.status(502).json({ error: err.message || 'Erreur lors de la récupération des cryptos disponibles.' });
+  }
+});
+
+router.post('/create-order-crypto', createOrderLimiter, async (req, res) => {
+  try {
+    const { productId, email, duration, payCurrency } = req.body;
     if (!productId) return res.status(400).json({ error: 'productId requis.' });
     if (!email) return res.status(400).json({ error: 'email requis pour recevoir la clé.' });
-    if (!LTC_ADDRESS) return res.status(503).json({ error: 'Paiement Litecoin non configuré (LTC_ADDRESS manquant).' });
+    if (!payCurrency) return res.status(400).json({ error: 'payCurrency requis (ex: btc, ltc, usdttrc20).' });
 
     const productDoc = await db.collection(PRODUCTS_COLLECTION).doc(productId).get();
     if (!productDoc.exists) return res.status(404).json({ error: 'Produit introuvable.' });
@@ -244,41 +265,144 @@ router.post('/create-order-ltc', createOrderLimiter, async (req, res) => {
       return res.status(400).json({ error: 'Offre (durée) invalide pour ce produit.' });
     }
 
-    const rate = await getLtcEurRate();
-    const amountLtc = eurToLtc(priceEur, rate);
     const createdAt = new Date().toISOString();
-    const expiresAt = new Date(Date.now() + LTC_ORDER_TTL_MS).toISOString();
-
     const orderRef = await db.collection(ORDERS_COLLECTION).add({
-      method: 'ltc',
+      method: 'crypto',
+      provider: 'nowpayments',
       productId,
       productName: product.name,
       duration,
       amountEur: priceEur,
-      amountLtc,
-      ltcEurRate: rate,
-      address: LTC_ADDRESS,
+      payCurrency,
       customerEmail: email,
       status: 'pending',
       createdAt,
-      expiresAt,
+    });
+
+    const ipnCallbackUrl = process.env.NOWPAYMENTS_IPN_CALLBACK_URL || undefined;
+
+    let payment;
+    try {
+      payment = await nowpayments.createPayment({
+        priceAmount: priceEur,
+        priceCurrency: 'eur',
+        payCurrency,
+        orderId: orderRef.id,
+        orderDescription: `${product.name} — ${DURATION_LABELS[duration] || duration}`,
+        ipnCallbackUrl,
+      });
+    } catch (npErr) {
+      await orderRef.update({ status: 'failed', error: npErr.message });
+      return res.status(502).json({ error: npErr.message || 'Erreur lors de la création du paiement crypto.' });
+    }
+
+    await orderRef.update({
+      nowpaymentsId: String(payment.payment_id),
+      payAddress: payment.pay_address,
+      payAmount: payment.pay_amount,
+      payCurrency: payment.pay_currency,
+      expiresAt: payment.expiration_estimate_date || null,
     });
 
     res.status(201).json({
       id: orderRef.id,
-      address: LTC_ADDRESS,
-      amountLtc,
+      paymentId: payment.payment_id,
+      address: payment.pay_address,
+      payAmount: payment.pay_amount,
+      payCurrency: payment.pay_currency,
       amountEur: priceEur,
-      rate,
-      expiresAt,
+      expiresAt: payment.expiration_estimate_date || null,
     });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Erreur serveur lors de la création de la commande LTC.' });
+    res.status(500).json({ error: 'Erreur serveur lors de la création de la commande crypto.' });
   }
 });
 
-router.get('/check-ltc/:orderId', checkLtcLimiter, async (req, res) => {
+router.post('/webhook/nowpayments', async (req, res) => {
+  try {
+    const signature = req.headers['x-nowpayments-sig'];
+    let isValid;
+    try {
+      isValid = nowpayments.verifyIpnSignature(req.body, signature);
+    } catch (sigErr) {
+      console.error('Vérification IPN impossible:', sigErr.message);
+      return res.status(500).json({ error: sigErr.message });
+    }
+
+    if (!isValid) {
+      console.warn('⚠️ Signature IPN NOWPayments invalide reçue.');
+      return res.status(401).json({ error: 'Signature invalide.' });
+    }
+
+    const payload = req.body;
+    const orderId = payload.order_id;
+    if (!orderId) return res.status(400).json({ error: 'order_id manquant dans le callback.' });
+
+    const orderRef = db.collection(ORDERS_COLLECTION).doc(orderId);
+    const orderSnap = await orderRef.get();
+    if (!orderSnap.exists) {
+      console.warn(`Commande introuvable pour le callback NOWPayments : ${orderId}`);
+      return res.status(404).json({ error: 'Commande introuvable.' });
+    }
+
+    const order = orderSnap.data();
+    const npStatus = payload.payment_status;
+
+    if (order.status === 'paid') {
+      return res.json({ received: true, alreadyPaid: true });
+    }
+
+    if (nowpayments.PAID_STATUSES.includes(npStatus)) {
+      let accessKey;
+      try {
+        accessKey = await consumeKey(order.productId, order.duration);
+      } catch (stockErr) {
+        console.error(`⚠️ Stock épuisé pour la commande ${orderId} (paiement NOWPayments déjà reçu) :`, stockErr.message);
+        await orderRef.update({
+          status: 'paid_no_stock',
+          npStatus,
+          actuallyPaid: payload.actually_paid,
+          paidAt: new Date().toISOString(),
+          stockError: stockErr.message,
+        });
+        return res.json({ received: true, stockIssue: true });
+      }
+
+      await orderRef.update({
+        status: 'paid',
+        npStatus,
+        actuallyPaid: payload.actually_paid,
+        paidAt: new Date().toISOString(),
+        accessKey,
+      });
+
+      if (order.customerEmail) {
+        try {
+          await sendOrderKeyEmail({
+            to: order.customerEmail,
+            productName: order.productName,
+            key: accessKey,
+            orderId,
+          });
+        } catch (mailErr) {
+          console.error('Erreur envoi email clé:', mailErr);
+        }
+      }
+    } else if (nowpayments.FAILED_STATUSES.includes(npStatus)) {
+      await orderRef.update({ status: npStatus === 'expired' ? 'expired' : 'failed', npStatus });
+    } else {
+      await orderRef.update({ status: 'pending_confirmation', npStatus });
+    }
+
+    res.json({ received: true });
+  } catch (err) {
+    console.error('Erreur traitement webhook NOWPayments:', err);
+    res.status(500).json({ error: 'Erreur serveur webhook.' });
+  }
+});
+
+router.get('/check-crypto/:orderId', checkLtcLimiter, async (req, res) => {
   try {
     const { orderId } = req.params;
     const orderRef = db.collection(ORDERS_COLLECTION).doc(orderId);
@@ -286,42 +410,43 @@ router.get('/check-ltc/:orderId', checkLtcLimiter, async (req, res) => {
     if (!orderDoc.exists) return res.status(404).json({ error: 'Commande introuvable.' });
 
     const order = orderDoc.data();
-    if (order.method !== 'ltc') {
-      return res.status(400).json({ error: 'Cette commande n\'est pas une commande Litecoin.' });
+    if (order.method !== 'crypto') {
+      return res.status(400).json({ error: 'Cette commande n\'est pas une commande crypto.' });
     }
 
     if (order.status === 'paid') {
-      return res.json({ status: 'paid', orderId });
+      return res.json({ status: 'paid', orderId, accessKey: order.accessKey });
     }
 
-    if (order.status === 'pending' || order.status === 'pending_confirmation') {
-      const expiresAt = order.expiresAt ? new Date(order.expiresAt).getTime() : null;
-      if (expiresAt && Date.now() > expiresAt) {
-        await orderRef.update({ status: 'expired' });
-        return res.status(410).json({
-          status: 'expired',
+    if (!order.nowpaymentsId) {
+      return res.json({ status: order.status, orderId });
+    }
+
+    const payment = await nowpayments.getPaymentStatus(order.nowpaymentsId);
+    const npStatus = payment.payment_status;
+
+    if (nowpayments.PAID_STATUSES.includes(npStatus) && order.status !== 'paid') {
+      let accessKey;
+      try {
+        accessKey = await consumeKey(order.productId, order.duration);
+      } catch (stockErr) {
+        console.error(`⚠️ Stock épuisé pour la commande ${orderId} (paiement crypto déjà reçu) :`, stockErr.message);
+        await orderRef.update({
+          status: 'paid_no_stock',
+          npStatus,
+          paidAt: new Date().toISOString(),
+          stockError: stockErr.message,
+        });
+        return res.status(202).json({
+          status: 'paid_no_stock',
           orderId,
-          error: 'Commande expirée. Veuillez créer une nouvelle commande.',
+          error: 'Paiement confirmé mais stock de clés épuisé. Le support va te contacter pour te fournir ta clé.',
         });
       }
-    }
 
-    if (order.status === 'expired') {
-      return res.status(410).json({
-        status: 'expired',
-        orderId,
-        error: 'Commande expirée. Veuillez créer une nouvelle commande.',
-      });
-    }
-
-    const { totalLtc, confirmedLtc } = await getReceivedSince(order.createdAt);
-    const expected = order.amountLtc * 0.99;
-
-    if (confirmedLtc >= expected) {
-      const accessKey = generateKey();
       await orderRef.update({
         status: 'paid',
-        confirmedLtc,
+        npStatus,
         paidAt: new Date().toISOString(),
         accessKey,
       });
@@ -339,25 +464,20 @@ router.get('/check-ltc/:orderId', checkLtcLimiter, async (req, res) => {
         }
       }
 
-      return res.json({ status: 'paid', orderId, confirmedLtc, accessKey });
+      return res.json({ status: 'paid', orderId, accessKey });
     }
 
-    if (totalLtc >= expected) {
-      await orderRef.update({ status: 'pending_confirmation', totalLtc });
-      return res.json({ status: 'pending_confirmation', orderId, totalLtc });
+    if (nowpayments.FAILED_STATUSES.includes(npStatus)) {
+      const newStatus = npStatus === 'expired' ? 'expired' : 'failed';
+      await orderRef.update({ status: newStatus, npStatus });
+      return res.status(410).json({ status: newStatus, orderId, error: 'Paiement expiré ou échoué.' });
     }
 
-    res.json({
-      status: 'pending',
-      orderId,
-      totalLtc,
-      confirmedLtc,
-      expected: order.amountLtc,
-      expiresAt: order.expiresAt,
-    });
+    await orderRef.update({ npStatus });
+    res.json({ status: 'pending', orderId, npStatus });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Erreur serveur lors de la vérification du paiement LTC.' });
+    res.status(500).json({ error: 'Erreur serveur lors de la vérification du paiement crypto.' });
   }
 });
 
