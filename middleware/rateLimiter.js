@@ -32,4 +32,12 @@ const checkLtcLimiter = rateLimit({
   message: { error: 'Trop de vérifications. Ralentissez le polling.' },
 });
 
-module.exports = { loginLimiter, createOrderLimiter, captureOrderLimiter, checkLtcLimiter };
+const uploadLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Trop d\'uploads. Attends une minute.' },
+});
+
+module.exports = { loginLimiter, createOrderLimiter, captureOrderLimiter, checkLtcLimiter, uploadLimiter };
