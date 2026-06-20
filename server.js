@@ -1,14 +1,27 @@
 require('dotenv').config();
 const express = require('express');
+const helmet = require('helmet');
 const cors = require('cors');
 
-const productsRouter = require('./routes/products');
-const paymentsRouter = require('./routes/payments');
-const authRouter = require('./routes/auth');
-const { loginLimiter } = require('./middleware/rateLimiter');
+const productsRouter    = require('./routes/products');
+const paymentsRouter    = require('./routes/payments');
+const authRouter        = require('./routes/auth');
+const adminRouter       = require('./routes/admin');
+const errorHandler      = require('./middleware/errorHandler');
+const { loginLimiter, uploadLimiter } = require('./middleware/rateLimiter');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+app.use(helmet());
+
+app.use((req, res, next) => {
+  if (process.env.NODE_ENV === 'production' && req.header('x-forwarded-proto') !== 'https') {
+    res.redirect(`https://${req.header('host')}${req.url}`);
+  } else {
+    next();
+  }
+});
 
 const allowedOrigins = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
@@ -32,13 +45,16 @@ app.get('/', (req, res) => {
 });
 
 app.use('/api/auth', loginLimiter, authRouter);
-
 app.use('/api/products', productsRouter);
+app.use('/api/products/upload-image', uploadLimiter);
 app.use('/api/payments', paymentsRouter);
+app.use('/api/admin', adminRouter);
 
 app.use((req, res) => {
   res.status(404).json({ error: 'Route introuvable.' });
 });
+
+app.use(errorHandler);
 
 app.listen(PORT, () => {
   console.log(`Serveur démarré sur http://localhost:${PORT}`);
